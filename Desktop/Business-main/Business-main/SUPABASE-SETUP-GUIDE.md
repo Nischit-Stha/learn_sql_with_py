@@ -54,7 +54,7 @@
 
 ```javascript
 // Test 1: Check if admin profile exists
-// Go to rentals/fornt end/index.html and open browser console
+// Go to rentals/frontend/index.html and open browser console
 // Run this:
 const client = window.getVeeraSupabaseClient();
 const { data: admin, error } = await client

@@ -73,7 +73,7 @@ python3 -m http.server 8080
 
 Open in browser:
 - Landing: `http://localhost:8080/index.html`
-- Rentals: `http://localhost:8080/rentals/fornt%20end/index.html`
+- Rentals: `http://localhost:8080/rentals/frontend/index.html`
 - Food: `http://localhost:8080/food/index.html`
 
 ## 📱 Deploy (GitHub Pages)
