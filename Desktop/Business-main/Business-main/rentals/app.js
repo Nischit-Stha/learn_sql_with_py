@@ -9,6 +9,7 @@ const BOOKING_REQUESTS_KEY = 'booking-requests-data';
 const INVOICES_KEY = 'rentals-invoices-data';
 const PRICE_OFFERS_KEY = 'price-offers-data';
 const LOCAL_CACHE_RESET_QUERY_PARAM = 'resetLocalData';
+const CLEAR_CARS_QUERY_PARAM = 'clearCars';
 const LOCAL_DATA_KEYS = [
     'fleet-data',
     'rentals-data',
@@ -237,11 +238,21 @@ function shouldResetLocalCacheFromUrl() {
     }
 }
 
+function shouldClearCarsFromUrl() {
+    try {
+        const params = new URLSearchParams(window.location.search || '');
+        return params.get(CLEAR_CARS_QUERY_PARAM) === '1';
+    } catch {
+        return false;
+    }
+}
+
 function removeResetParamFromUrl() {
     try {
         const url = new URL(window.location.href);
-        if (!url.searchParams.has(LOCAL_CACHE_RESET_QUERY_PARAM)) return;
+        if (!url.searchParams.has(LOCAL_CACHE_RESET_QUERY_PARAM) && !url.searchParams.has(CLEAR_CARS_QUERY_PARAM)) return;
         url.searchParams.delete(LOCAL_CACHE_RESET_QUERY_PARAM);
+        url.searchParams.delete(CLEAR_CARS_QUERY_PARAM);
         window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
     } catch {
         // Ignore URL cleanup errors.
@@ -250,6 +261,39 @@ function removeResetParamFromUrl() {
 
 window.resetLocalRentalData = function resetLocalRentalData() {
     clearLocalRentalData();
+    window.location.reload();
+};
+
+async function clearFleetDataEverywhere() {
+    fleet = [];
+    localStorage.removeItem('fleet-data');
+    localStorage.setItem('records-imported-v1', 'true');
+
+    const client = getSupabaseClient();
+    if (!client) {
+        return { remoteDeleted: false };
+    }
+
+    try {
+        const { error } = await client
+            .from('vehicles')
+            .delete()
+            .gte('id', 0);
+
+        if (error) {
+            console.warn('Supabase vehicles delete failed:', error.message || error);
+            return { remoteDeleted: false };
+        }
+
+        return { remoteDeleted: true };
+    } catch (error) {
+        console.warn('Supabase vehicles delete exception:', error);
+        return { remoteDeleted: false };
+    }
+}
+
+window.clearAllCarsData = async function clearAllCarsData() {
+    await clearFleetDataEverywhere();
     window.location.reload();
 };
 
@@ -695,6 +739,34 @@ async function syncBookingRequestsToSupabase(requests) {
 
         if (error) {
             console.warn('Supabase booking requests upsert failed:', error.message || error);
+            return;
+        }
+
+        const { data: remoteRows, error: remoteError } = await client
+            .from('booking_requests')
+            .select('id');
+
+        if (remoteError || !Array.isArray(remoteRows)) {
+            if (remoteError) {
+                console.warn('Supabase booking requests id-read failed:', remoteError.message || remoteError);
+            }
+            return;
+        }
+
+        const localIds = new Set(payload.map(item => Number(item.id)).filter(id => Number.isFinite(id) && id > 0));
+        const staleIds = remoteRows
+            .map(row => Number(row.id))
+            .filter(id => Number.isFinite(id) && !localIds.has(id));
+
+        if (staleIds.length) {
+            const { error: deleteError } = await client
+                .from('booking_requests')
+                .delete()
+                .in('id', staleIds);
+
+            if (deleteError) {
+                console.warn('Supabase booking requests stale-delete failed:', deleteError.message || deleteError);
+            }
         }
     } catch (error) {
         console.warn('Supabase booking requests upsert exception:', error);
@@ -773,8 +845,14 @@ async function reimportFromRecords() {
 
 // Load from localStorage if available
 async function loadData() {
+    if (shouldClearCarsFromUrl()) {
+        await clearFleetDataEverywhere();
+        removeResetParamFromUrl();
+    }
+
     if (shouldResetLocalCacheFromUrl()) {
         clearLocalRentalData();
+        localStorage.setItem('records-imported-v1', 'true');
         removeResetParamFromUrl();
     }
 
@@ -1031,6 +1109,91 @@ function getOperationalInsights() {
         unpaidInvoices,
         riskScore: overdueReturns + unpaidInvoices + pendingBargains
     };
+}
+
+function getDashboardNotifications() {
+    const notifications = [];
+    const now = new Date();
+    const bookingRequests = getBookingRequests();
+
+    const pendingScannerRequests = bookingRequests
+        .filter(request => String(request.source || '').toLowerCase() === 'scanner-pickup')
+        .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+
+    pendingScannerRequests.slice(0, 3).forEach(request => {
+        notifications.push({
+            level: 'info',
+            createdAt: request.createdAt || new Date().toISOString(),
+            text: `New scanner pickup request from ${request.customer || 'Customer'} for ${request.car || 'Vehicle'}.`,
+            actionLabel: 'Review',
+            actionKey: 'pending-approvals'
+        });
+    });
+
+    const overdueRentals = rentals
+        .filter(rental => (rental.status || 'active') === 'active')
+        .filter(rental => new Date(rental.returnDate) < now)
+        .sort((a, b) => new Date(a.returnDate) - new Date(b.returnDate));
+
+    overdueRentals.slice(0, 2).forEach(rental => {
+        notifications.push({
+            level: 'warning',
+            createdAt: rental.returnDate,
+            text: `Overdue return: ${rental.customer || 'Customer'} (${rental.car || 'Vehicle'}).`,
+            actionLabel: 'Open',
+            actionKey: 'overdue-returns'
+        });
+    });
+
+    const unpaidInvoice = invoices.find(invoice => Number(invoice.totalAmount || 0) > Number(invoice.paidAmount || 0));
+    if (unpaidInvoice) {
+        notifications.push({
+            level: 'warning',
+            createdAt: unpaidInvoice.updatedAt || unpaidInvoice.createdAt || new Date().toISOString(),
+            text: `Unpaid invoice pending for ${unpaidInvoice.customer || 'Customer'} (${unpaidInvoice.invoiceNumber || 'No Ref'}).`,
+            actionLabel: 'Inspect',
+            actionKey: 'unpaid-invoices'
+        });
+    }
+
+    if (!notifications.length) {
+        notifications.push({
+            level: 'ok',
+            createdAt: new Date().toISOString(),
+            text: 'No urgent notifications right now. Operations look stable.',
+            actionLabel: '',
+            actionKey: ''
+        });
+    }
+
+    return notifications
+        .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+        .slice(0, 6);
+}
+
+function renderDashboardNotifications() {
+    const list = document.getElementById('dashboard-notifications-list');
+    const count = document.getElementById('notification-count');
+    if (!list || !count) return;
+
+    const notifications = getDashboardNotifications();
+    const actionableCount = notifications.filter(item => item.actionKey).length;
+    count.textContent = actionableCount;
+
+    list.innerHTML = notifications.map(item => {
+        const levelClass = item.level === 'warning' ? 'warning' : item.level === 'ok' ? 'ok' : 'info';
+        const timestamp = new Date(item.createdAt || Date.now());
+
+        return `
+            <article class="dashboard-notice ${levelClass}">
+                <div>
+                    <p class="dashboard-notice-text">${item.text}</p>
+                    <p class="dashboard-notice-time">${timestamp.toLocaleString()}</p>
+                </div>
+                ${item.actionKey ? `<button type="button" class="btn btn-secondary btn-compact" onclick="handleActionCenter('${item.actionKey}')">${item.actionLabel || 'Open'}</button>` : ''}
+            </article>
+        `;
+    }).join('');
 }
 
 let editingCarId = null;
@@ -1335,6 +1498,8 @@ function updateStats() {
     if (updatedEl) {
         updatedEl.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
     }
+
+    renderDashboardNotifications();
 
     renderRevenueGraph();
     renderRevenueAnalytics();
@@ -2108,13 +2273,14 @@ function renderBookingRequests() {
         const pickup = new Date(request.pickupDate);
         const dropoff = new Date(request.returnDate);
         const statusHint = requestedCar?.status === 'available' ? '✅ Available' : '⚠️ Currently unavailable';
+        const sourceLabel = String(request.source || 'customer-portal') === 'scanner-pickup' ? 'Scanner Pickup' : 'Customer Portal';
 
         return `
             <div style="background:white; border:1px solid #e5e7eb; border-radius:12px; padding:1rem 1.25rem; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
                 <div style="display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; align-items:flex-start;">
                     <div>
                         <h4 style="margin:0 0 0.35rem 0; color:#111827;">${request.customer || 'Customer'} — ${carName}</h4>
-                        <p style="margin:0; color:#6b7280; font-size:0.9rem;">📅 Requested: ${createdAt.toLocaleString()} • ${statusHint}</p>
+                        <p style="margin:0; color:#6b7280; font-size:0.9rem;">📅 Requested: ${createdAt.toLocaleString()} • ${statusHint} • ${sourceLabel}</p>
                     </div>
                     <div style="display:flex; gap:0.5rem; flex-wrap:wrap;">
                         <button class="btn-small btn-edit" onclick="showRequestCustomerProfile(${Number(request.id)})">👤 Customer</button>
