@@ -797,7 +797,7 @@
     </div>
     
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
-    <script src="supabase-config.js"></script>
+    <script src="../supabase-config.js"></script>
     <script>
         let serviceType = 'pickup';
         let photos = [];
@@ -898,7 +898,7 @@
         }
         
         // Lookup rego for drop-off
-        function lookupRego() {
+        async function lookupRego() {
             const rego = document.getElementById('rego-input').value.trim().toUpperCase();
             
             if (!rego) {
@@ -906,15 +906,58 @@
                 return;
             }
             
-            // Search in active pickups/rentals
-            const pickups = JSON.parse(localStorage.getItem('veera-rentals-pickups') || '[]');
-            const rentals = JSON.parse(localStorage.getItem('rentals-data') || '[]');
-            
-            // Find rental by rego
-            let foundRental = pickups.find(p => p.vehicle && p.vehicle.rego && p.vehicle.rego.toUpperCase() === rego);
-            
+            let foundRental = null;
+
+            try {
+                const client = getSupabaseClient();
+                if (client) {
+                    const { data: vehicleRows, error: vehicleError } = await client
+                        .from('vehicles')
+                        .select('id,name,make,model,plate')
+                        .eq('plate', rego)
+                        .limit(1);
+
+                    if (!vehicleError && Array.isArray(vehicleRows) && vehicleRows.length) {
+                        const vehicle = vehicleRows[0];
+                        const { data: bookingRows, error: bookingError } = await client
+                            .from('booking_requests')
+                            .select('*')
+                            .eq('vehicle_id', Number(vehicle.id))
+                            .in('status', ['active', 'approved'])
+                            .order('created_at', { ascending: false })
+                            .limit(1);
+
+                        if (!bookingError && Array.isArray(bookingRows) && bookingRows.length) {
+                            const booking = bookingRows[0];
+                            foundRental = {
+                                bookingRequestId: Number(booking.id),
+                                customerName: booking.customer || 'Customer',
+                                customerPhone: booking.phone || '',
+                                mileage: '',
+                                vehicle: {
+                                    id: Number(vehicle.id),
+                                    name: vehicle.name || `${vehicle.make || ''} ${vehicle.model || ''}`.trim() || 'Vehicle',
+                                    make: vehicle.make || '',
+                                    model: vehicle.model || '',
+                                    rego: vehicle.plate,
+                                    license: vehicle.plate
+                                }
+                            };
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn('Supabase rego lookup failed:', error);
+            }
+
             if (!foundRental) {
-                foundRental = rentals.find(r => r.vehicle && r.vehicle.rego && r.vehicle.rego.toUpperCase() === rego);
+                const pickups = JSON.parse(localStorage.getItem('veera-rentals-pickups') || '[]');
+                const rentals = JSON.parse(localStorage.getItem('rentals-data') || '[]');
+
+                foundRental = pickups.find(p => p.vehicle && p.vehicle.rego && p.vehicle.rego.toUpperCase() === rego);
+                if (!foundRental) {
+                    foundRental = rentals.find(r => r.vehicle && r.vehicle.rego && r.vehicle.rego.toUpperCase() === rego);
+                }
             }
             
             if (foundRental) {
@@ -955,10 +998,48 @@
         
         // Load available vehicles as visual cards (for pickup)
         function loadAvailableVehiclesAsCards() {
-            const fleet = JSON.parse(localStorage.getItem('fleet-data') || '[]');
-            availableVehicles = fleet.filter(v => v.status === 'available');
+            const fallbackFleet = JSON.parse(localStorage.getItem('fleet-data') || '[]');
+            availableVehicles = fallbackFleet.filter(v => v.status === 'available');
             renderVehicleCards(availableVehicles);
             initializeVehicleShopControls();
+
+            void (async () => {
+                try {
+                    const client = getSupabaseClient();
+                    if (!client) return;
+
+                    const { data, error } = await client
+                        .from('vehicles')
+                        .select('id,name,make,model,plate,status,rate_day,rate_week,location,images')
+                        .eq('status', 'available')
+                        .order('id', { ascending: true });
+
+                    if (error || !Array.isArray(data)) {
+                        if (error) {
+                            console.warn('Supabase vehicle load failed:', error.message || error);
+                        }
+                        return;
+                    }
+
+                    availableVehicles = data.map(vehicle => ({
+                        id: Number(vehicle.id),
+                        name: vehicle.name,
+                        make: vehicle.make,
+                        model: vehicle.model,
+                        rego: vehicle.plate,
+                        license: vehicle.plate,
+                        status: vehicle.status || 'available',
+                        rate: Number(vehicle.rate_day || 0),
+                        priceDay: Number(vehicle.rate_day || 0),
+                        priceWeek: Number(vehicle.rate_week || 0),
+                        images: Array.isArray(vehicle.images) ? vehicle.images : []
+                    }));
+
+                    renderVehicleCards(availableVehicles);
+                } catch (error) {
+                    console.warn('Supabase vehicle load exception:', error);
+                }
+            })();
         }
 
         function buildScannerPickupRequest(serviceData) {
@@ -966,7 +1047,18 @@
             const returnAt = new Date(pickupAt.getTime() + (24 * 60 * 60 * 1000));
             const carName = serviceData.vehicle?.name || `${serviceData.vehicle?.make || ''} ${serviceData.vehicle?.model || ''}`.trim() || 'Vehicle';
             const existingNotes = serviceData.notes ? String(serviceData.notes).trim() : '';
-            const scannerMeta = `Scanner ref: ${serviceData.serviceRef} | Odometer: ${serviceData.mileage || 'N/A'} | Photos: ${serviceData.photoCount || 0}`;
+            const scannerPayload = {
+                serviceRef: serviceData.serviceRef,
+                type: serviceData.type,
+                odometer: serviceData.mileage || 'N/A',
+                location: serviceData.location || null,
+                photoCount: serviceData.photoCount || 0,
+                photoUrls: Array.isArray(serviceData.photos) ? serviceData.photos.map(item => item.url).filter(Boolean) : [],
+                submittedAt: serviceData.timestamp,
+                formNotes: serviceData.notes || ''
+            };
+
+            const scannerMeta = `SCANNER_FORM::${JSON.stringify(scannerPayload)}`;
 
             return {
                 id: Date.now() + Math.floor(Math.random() * 1000),
@@ -977,7 +1069,7 @@
                 carId: Number(serviceData.vehicle?.id || 0) || null,
                 pickupDate: pickupAt.toISOString(),
                 returnDate: returnAt.toISOString(),
-                notes: existingNotes ? `${existingNotes} | ${scannerMeta}` : scannerMeta,
+                notes: existingNotes ? `${existingNotes}\n${scannerMeta}` : scannerMeta,
                 status: 'pending',
                 source: 'scanner-pickup',
                 createdAt: new Date().toISOString()
@@ -1019,6 +1111,80 @@
                 return true;
             } catch (error) {
                 console.warn('Supabase booking request save exception:', error);
+                return false;
+            }
+        }
+
+        async function saveServiceEventToSupabase(serviceData) {
+            try {
+                const client = getSupabaseClient();
+                if (!client) return false;
+
+                const vehicleId = Number(serviceData.vehicle?.id || 0) || null;
+                if (!vehicleId) return false;
+
+                let bookingRow = null;
+                if (Number(currentRental?.bookingRequestId)) {
+                    const { data, error } = await client
+                        .from('booking_requests')
+                        .select('id,notes,status')
+                        .eq('id', Number(currentRental.bookingRequestId))
+                        .limit(1);
+
+                    if (!error && Array.isArray(data) && data.length) {
+                        bookingRow = data[0];
+                    }
+                }
+
+                if (!bookingRow) {
+                    const { data, error } = await client
+                        .from('booking_requests')
+                        .select('id,notes,status')
+                        .eq('vehicle_id', vehicleId)
+                        .in('status', ['active', 'approved', 'pending'])
+                        .order('created_at', { ascending: false })
+                        .limit(1);
+
+                    if (error || !Array.isArray(data) || !data.length) {
+                        if (error) {
+                            console.warn('Could not locate booking request for service event:', error.message || error);
+                        }
+                        return false;
+                    }
+
+                    bookingRow = data[0];
+                }
+
+                const eventPayload = {
+                    serviceRef: serviceData.serviceRef,
+                    type: serviceData.type,
+                    submittedAt: serviceData.timestamp,
+                    odometer: serviceData.mileage || 'N/A',
+                    location: serviceData.location || null,
+                    photoCount: serviceData.photoCount || 0,
+                    photoUrls: Array.isArray(serviceData.photos) ? serviceData.photos.map(item => item.url).filter(Boolean) : [],
+                    vehicleRego: serviceData.vehicle?.rego || serviceData.vehicle?.license || '',
+                    formNotes: serviceData.notes || ''
+                };
+
+                const marker = `SERVICE_EVENT::${JSON.stringify(eventPayload)}`;
+                const existingNotes = bookingRow.notes ? String(bookingRow.notes).trim() : '';
+                const updatedNotes = existingNotes ? `${existingNotes}\n${marker}` : marker;
+                const updatedStatus = serviceType === 'dropoff' ? 'completed' : bookingRow.status || 'active';
+
+                const { error: updateError } = await client
+                    .from('booking_requests')
+                    .update({ notes: updatedNotes, status: updatedStatus })
+                    .eq('id', Number(bookingRow.id));
+
+                if (updateError) {
+                    console.warn('Supabase service event update failed:', updateError.message || updateError);
+                    return false;
+                }
+
+                return true;
+            } catch (error) {
+                console.warn('Supabase service event update exception:', error);
                 return false;
             }
         }
@@ -1569,19 +1735,11 @@
                 timestamp: new Date().toISOString()
             };
             
-            // Save to localStorage
-            const storageKey = `veera-rentals-${serviceType}s`;
-            const records = JSON.parse(localStorage.getItem(storageKey) || '[]');
-            records.push(serviceData);
-            localStorage.setItem(storageKey, JSON.stringify(records));
-
             if (serviceType === 'pickup') {
                 const pickupRequest = buildScannerPickupRequest(serviceData);
-                const bookingRequestsKey = 'booking-requests-data';
-                const bookingRequests = JSON.parse(localStorage.getItem(bookingRequestsKey) || '[]');
-                bookingRequests.unshift(pickupRequest);
-                localStorage.setItem(bookingRequestsKey, JSON.stringify(bookingRequests));
                 await saveBookingRequestToSupabase(pickupRequest);
+            } else {
+                await saveServiceEventToSupabase(serviceData);
             }
             
             // Show success message

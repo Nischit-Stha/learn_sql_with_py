@@ -3,11 +3,14 @@ let fleet = [];
 
 let rentals = [];
 let invoices = [];
+let bookingRequestsCache = [];
+let priceOffersCache = [];
 
 const DEFAULT_RATE = 250;
 const BOOKING_REQUESTS_KEY = 'booking-requests-data';
 const INVOICES_KEY = 'rentals-invoices-data';
 const PRICE_OFFERS_KEY = 'price-offers-data';
+const DATABASE_ONLY_MODE = true;
 const LOCAL_CACHE_RESET_QUERY_PARAM = 'resetLocalData';
 const CLEAR_CARS_QUERY_PARAM = 'clearCars';
 const LOCAL_DATA_KEYS = [
@@ -16,6 +19,9 @@ const LOCAL_DATA_KEYS = [
     INVOICES_KEY,
     BOOKING_REQUESTS_KEY,
     PRICE_OFFERS_KEY,
+    'veera-rentals-pickups',
+    'veera-rentals-dropoffs',
+    'veera-rentals-swaps',
     'records-imported-v1'
 ];
 let activeFleetFilter = 'all';
@@ -155,6 +161,10 @@ function isDateRangeOverlapping(firstStart, firstEnd, secondStart, secondEnd) {
 }
 
 function getBookingRequests() {
+    if (DATABASE_ONLY_MODE) {
+        return Array.isArray(bookingRequestsCache) ? bookingRequestsCache : [];
+    }
+
     try {
         const raw = localStorage.getItem(BOOKING_REQUESTS_KEY);
         const parsed = raw ? JSON.parse(raw) : [];
@@ -165,11 +175,18 @@ function getBookingRequests() {
 }
 
 function saveBookingRequests(requests) {
-    localStorage.setItem(BOOKING_REQUESTS_KEY, JSON.stringify(requests));
+    bookingRequestsCache = Array.isArray(requests) ? requests : [];
+    if (!DATABASE_ONLY_MODE) {
+        localStorage.setItem(BOOKING_REQUESTS_KEY, JSON.stringify(bookingRequestsCache));
+    }
     void syncBookingRequestsToSupabase(requests);
 }
 
 function getPriceOffers() {
+    if (DATABASE_ONLY_MODE) {
+        return Array.isArray(priceOffersCache) ? priceOffersCache : [];
+    }
+
     try {
         const raw = localStorage.getItem(PRICE_OFFERS_KEY);
         const parsed = raw ? JSON.parse(raw) : [];
@@ -180,7 +197,10 @@ function getPriceOffers() {
 }
 
 function savePriceOffers(offers) {
-    localStorage.setItem(PRICE_OFFERS_KEY, JSON.stringify(offers));
+    priceOffersCache = Array.isArray(offers) ? offers : [];
+    if (!DATABASE_ONLY_MODE) {
+        localStorage.setItem(PRICE_OFFERS_KEY, JSON.stringify(priceOffersCache));
+    }
     void syncPriceOffersToSupabase(offers);
 }
 
@@ -223,6 +243,31 @@ function normalizeRentalDates(rentalList = []) {
         pickupDate: new Date(r.pickupDate),
         returnDate: new Date(r.returnDate)
     }));
+}
+
+function syncRentalsFromBookingRequestsCache() {
+    if (!DATABASE_ONLY_MODE) return;
+
+    rentals = bookingRequestsCache
+        .filter(request => {
+            const status = String(request.status || '').toLowerCase();
+            return status === 'active' || status === 'completed';
+        })
+        .map(request => ({
+            id: Number(request.id),
+            customer: request.customer || 'Customer',
+            phone: request.phone || 'N/A',
+            email: request.email || '',
+            car: request.car || 'Vehicle',
+            carId: Number(request.carId || 0) || null,
+            pickupDate: new Date(request.pickupDate),
+            returnDate: new Date(request.returnDate),
+            notes: request.notes || '',
+            status: String(request.status || 'active').toLowerCase(),
+            source: request.source || 'customer-portal',
+            createdAt: request.createdAt || new Date().toISOString(),
+            approvedAt: request.approvedAt || null
+        }));
 }
 
 function clearLocalRentalData() {
@@ -800,7 +845,7 @@ async function loadFleetFromSupabase() {
 }
 
 async function importSeedDataFromRecords() {
-    const response = await fetch('records-seed.json', { cache: 'no-store' });
+    const response = await fetch('../records-seed.json', { cache: 'no-store' });
     if (!response.ok) {
         throw new Error('Seed file unavailable');
     }
@@ -857,31 +902,33 @@ async function loadData() {
     }
 
     suppressRemoteSync = true;
-    const savedFleet = localStorage.getItem('fleet-data');
-    const savedRentals = localStorage.getItem('rentals-data');
-    const importedFlag = localStorage.getItem('records-imported-v1') === 'true';
-    const savedInvoices = localStorage.getItem(INVOICES_KEY);
+    if (!DATABASE_ONLY_MODE) {
+        const savedFleet = localStorage.getItem('fleet-data');
+        const savedRentals = localStorage.getItem('rentals-data');
+        const importedFlag = localStorage.getItem('records-imported-v1') === 'true';
+        const savedInvoices = localStorage.getItem(INVOICES_KEY);
 
-    if (!importedFlag) {
-        try {
-            await importSeedDataFromRecords();
-        } catch (error) {
-            console.warn('Could not import Records seed data:', error);
+        if (!importedFlag) {
+            try {
+                await importSeedDataFromRecords();
+            } catch (error) {
+                console.warn('Could not import Records seed data:', error);
+            }
         }
-    }
 
-    if (savedFleet) {
-        fleet = JSON.parse(savedFleet);
-    }
-    if (savedRentals) {
-        rentals = normalizeRentalDates(JSON.parse(savedRentals));
-    }
-    if (savedInvoices) {
-        try {
-            const parsedInvoices = JSON.parse(savedInvoices);
-            invoices = Array.isArray(parsedInvoices) ? parsedInvoices : [];
-        } catch {
-            invoices = [];
+        if (savedFleet) {
+            fleet = JSON.parse(savedFleet);
+        }
+        if (savedRentals) {
+            rentals = normalizeRentalDates(JSON.parse(savedRentals));
+        }
+        if (savedInvoices) {
+            try {
+                const parsedInvoices = JSON.parse(savedInvoices);
+                invoices = Array.isArray(parsedInvoices) ? parsedInvoices : [];
+            } catch {
+                invoices = [];
+            }
         }
     }
 
@@ -898,19 +945,28 @@ async function loadData() {
     }
 
     const supabaseRequests = await loadBookingRequestsFromSupabase();
-    if (Array.isArray(supabaseRequests) && supabaseRequests.length > 0) {
-        localStorage.setItem(BOOKING_REQUESTS_KEY, JSON.stringify(supabaseRequests));
+    if (Array.isArray(supabaseRequests)) {
+        bookingRequestsCache = supabaseRequests;
+        syncRentalsFromBookingRequestsCache();
+        if (!DATABASE_ONLY_MODE && supabaseRequests.length > 0) {
+            localStorage.setItem(BOOKING_REQUESTS_KEY, JSON.stringify(supabaseRequests));
+        }
     }
 
     const supabaseOffers = await loadPriceOffersFromSupabase();
-    if (Array.isArray(supabaseOffers) && supabaseOffers.length > 0) {
-        localStorage.setItem(PRICE_OFFERS_KEY, JSON.stringify(supabaseOffers));
+    if (Array.isArray(supabaseOffers)) {
+        priceOffersCache = supabaseOffers;
+        if (!DATABASE_ONLY_MODE && supabaseOffers.length > 0) {
+            localStorage.setItem(PRICE_OFFERS_KEY, JSON.stringify(supabaseOffers));
+        }
     }
 
     const supabaseInvoices = await loadInvoicesFromSupabase();
-    if (Array.isArray(supabaseInvoices) && supabaseInvoices.length > 0) {
+    if (Array.isArray(supabaseInvoices)) {
         invoices = supabaseInvoices;
-        localStorage.setItem(INVOICES_KEY, JSON.stringify(supabaseInvoices));
+        if (!DATABASE_ONLY_MODE && supabaseInvoices.length > 0) {
+            localStorage.setItem(INVOICES_KEY, JSON.stringify(supabaseInvoices));
+        }
     }
 
     suppressRemoteSync = false;
@@ -922,9 +978,11 @@ async function loadData() {
 
 function saveData(options = {}) {
     const { syncRemote = true } = options;
-    localStorage.setItem('fleet-data', JSON.stringify(fleet));
-    localStorage.setItem('rentals-data', JSON.stringify(rentals));
-    localStorage.setItem(INVOICES_KEY, JSON.stringify(invoices));
+    if (!DATABASE_ONLY_MODE) {
+        localStorage.setItem('fleet-data', JSON.stringify(fleet));
+        localStorage.setItem('rentals-data', JSON.stringify(rentals));
+        localStorage.setItem(INVOICES_KEY, JSON.stringify(invoices));
+    }
     if (!suppressRemoteSync && syncRemote) {
         void syncInvoicesToSupabase(invoices);
         void syncFleetToSupabase(fleet);
@@ -1096,7 +1154,7 @@ function getOperationalInsights() {
         return hours >= 0 && hours <= 24;
     }).length;
     const returnsToday = activeRentals.filter(rental => isSameCalendarDate(new Date(rental.returnDate), now)).length;
-    const pendingApprovals = bookingRequests.length;
+    const pendingApprovals = bookingRequests.filter(request => String(request.status || 'pending').toLowerCase() === 'pending').length;
     const pendingBargains = priceOffers.filter(offer => String(offer.status || 'pending').toLowerCase() === 'pending').length;
     const unpaidInvoices = invoices.filter(invoice => Number(invoice.totalAmount || 0) > Number(invoice.paidAmount || 0)).length;
 
@@ -2229,7 +2287,7 @@ function renderBookingRequests() {
     const count = document.getElementById('booking-requests-count');
     if (!list || !count) return;
 
-    const requests = getBookingRequests();
+    const requests = getBookingRequests().filter(request => String(request.status || 'pending').toLowerCase() === 'pending');
 
     const searchedRequests = requests.filter(request => {
         if (!requestSearchQuery) return true;
@@ -2594,28 +2652,15 @@ function approveBookingRequest(requestId) {
         return;
     }
 
-    const newRental = {
-        id: rentals.length ? Math.max(...rentals.map(r => Number(r.id) || 0)) + 1 : 1,
-        customer: request.customer || 'Customer',
-        phone: request.phone || 'N/A',
-        email: request.email || '',
-        car: car.name,
-        carId: car.id,
-        pickupDate: new Date(request.pickupDate),
-        returnDate: new Date(request.returnDate),
-        notes: request.notes || '',
-        status: 'active',
-        source: 'customer-request',
-        createdAt: request.createdAt || new Date().toISOString(),
-        approvedAt: new Date().toISOString()
-    };
+    request.status = 'active';
+    request.approvedAt = new Date().toISOString();
+    request.car = request.car || car.name;
+    request.carId = request.carId || car.id;
 
-    rentals.push(newRental);
     car.status = 'rented';
-    generateInvoiceFromRental(newRental.id);
-
-    const updatedRequests = requests.filter(item => Number(item.id) !== Number(requestId));
-    saveBookingRequests(updatedRequests);
+    saveBookingRequests(requests);
+    syncRentalsFromBookingRequestsCache();
+    generateInvoiceFromRental(Number(request.id));
     saveData();
 
     updateStats();
@@ -2626,36 +2671,78 @@ function approveBookingRequest(requestId) {
     renderInvoiceCenter();
     populateCarSelect();
 
-    showToast(`Booking approved for ${newRental.customer}`, 'success');
+    showToast(`Booking approved for ${request.customer || 'Customer'}`, 'success');
 }
 
 function rejectBookingRequest(requestId) {
     const requests = getBookingRequests();
-    const exists = requests.some(item => Number(item.id) === Number(requestId));
-    if (!exists) {
+    const request = requests.find(item => Number(item.id) === Number(requestId));
+    if (!request) {
         showToast('Booking request not found.', 'warning');
         return;
     }
 
-    const updatedRequests = requests.filter(item => Number(item.id) !== Number(requestId));
-    saveBookingRequests(updatedRequests);
+    request.status = 'rejected';
+    request.rejectedAt = new Date().toISOString();
+    saveBookingRequests(requests);
     renderBookingRequests();
     updateStats();
     showToast('Booking request rejected.', 'info');
 }
 
+function parseServiceEventsFromNotes(notesText = '') {
+    if (!hasMeaningfulValue(notesText)) return [];
+
+    const markers = ['SCANNER_FORM::', 'SERVICE_EVENT::'];
+    const events = [];
+
+    String(notesText)
+        .split('\n')
+        .map(line => String(line || '').trim())
+        .filter(Boolean)
+        .forEach(line => {
+            const marker = markers.find(item => line.startsWith(item));
+            if (!marker) return;
+
+            const rawJson = line.slice(marker.length).trim();
+            if (!rawJson) return;
+
+            try {
+                const payload = JSON.parse(rawJson);
+                events.push(payload);
+            } catch {
+                // Ignore malformed marker payloads.
+            }
+        });
+
+    return events;
+}
+
 // ===== RENDER SERVICE HISTORY =====
 function renderServiceHistory() {
     const historyList = document.getElementById('service-history-list');
-    const pickups = JSON.parse(localStorage.getItem('veera-rentals-pickups') || '[]').slice(-5);
-    const dropoffs = JSON.parse(localStorage.getItem('veera-rentals-dropoffs') || '[]').slice(-5);
-    const swaps = JSON.parse(localStorage.getItem('veera-rentals-swaps') || '[]').slice(-5);
-    
-    const allServices = [
-        ...pickups.map(p => ({ ...p, type: 'Pickup' })),
-        ...dropoffs.map(d => ({ ...d, type: 'Drop-off' })),
-        ...swaps.map(s => ({ ...s, type: 'Swap' }))
-    ].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp)).slice(0, 8);
+    if (!historyList) return;
+
+    const allServices = getBookingRequests()
+        .flatMap(request => {
+            const events = parseServiceEventsFromNotes(request.notes);
+            return events.map(event => ({
+                type: String(event.type || 'pickup').toLowerCase() === 'dropoff'
+                    ? 'Drop-off'
+                    : String(event.type || 'pickup').toLowerCase() === 'swap'
+                        ? 'Swap'
+                        : 'Pickup',
+                serviceRef: event.serviceRef || 'N/A',
+                timestamp: event.submittedAt || request.createdAt || new Date().toISOString(),
+                customerName: request.customer || 'Customer',
+                vehicle: {
+                    name: request.car || 'Vehicle',
+                    rego: event.vehicleRego || 'N/A'
+                }
+            }));
+        })
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .slice(0, 8);
     
     if (allServices.length === 0) {
         historyList.innerHTML = '<div style="padding: 2rem; text-align: center; color: #999;"><p>No service records yet</p></div>';
